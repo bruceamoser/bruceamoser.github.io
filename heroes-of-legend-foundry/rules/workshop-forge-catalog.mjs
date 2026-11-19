@@ -1,0 +1,90 @@
+import { forgeSignatureRecord } from "./forge-signatures.mjs";
+import { DEFAULT_LANGUAGES } from "./languages.mjs";
+import { forgeInventory } from "./forge-character.mjs";
+
+const body = (text) => [{ text }];
+const details = (fields) => Object.entries(fields)
+  .filter(([, value]) => value)
+  .map(([label, value]) => ({ label, value }));
+
+export function workshopCatalogs(choices, inventory, wounds, forge, references = {}) {
+  const legacyChoices = choices.records;
+  const legacy = new Map(legacyChoices.map((record) => [record.id, record]));
+  const ancestry = forge.ancestries.map((record) => ({
+    ...legacy.get(record.id),
+    ...record,
+    kind: "ancestry",
+    hp: record.hpContribution,
+    speed: record.baseSpeed,
+    coins: record.coinContribution,
+  }));
+  const origins = forge.origins.map((record) => ({
+    ...record,
+    kind: "origin",
+    originType: record.kind,
+    coins: record.coinContribution,
+    pairs: record.pairs.map((pair) => ({ ...pair, abilityId: pair.entryId })),
+  }));
+  const classes = forge.classes.map((record) => ({
+    ...record,
+    kind: "class",
+    hp: record.hpContribution,
+    coins: record.coinContribution,
+    startingDisciplines: record.disciplineIds,
+  }));
+  const nodes = forge.nodes.map((node) => {
+    if (node.kind === "discipline" || node.kind === "section") return node;
+    const action = node.effect?.match(/^((?:Main Action|Maneuver|Reaction)(?: · (?:One exchange|\d+ (?:minutes?|hours?|days?)))?|Passive|Movement|Ritual|One exchange|\d+ (?:minutes?|hours?|days?))\b/i)?.[1] ??
+      "Passive";
+    const attribute = node.attributeChoices?.length
+      ? node.attributeChoices.map(key => key[0].toUpperCase() + key.slice(1)).join(" or ")
+      : ["craft:supplies:1", "craft:workshop:1", "medicine:diagnosis:7"].includes(node.id) ? "Knowledge" :
+        node.effect?.split("\n")[0]?.match(/ · (Brawn|Fortitude|Agility|Guile|Knowledge|Reason)\b/)?.[1];
+    return {
+      ...node,
+      kind: "ability",
+      disciplineIds: node.disciplineId ? [node.disciplineId] : (node.disciplineIds ?? node.requires
+        .map((id) => forge.nodes.find((entry) => entry.id === id)?.disciplineId).filter(Boolean)),
+      reference: node.reference ?? {
+        flavor: [],
+        rules: { details: details({ Action: action, Attribute: attribute }), body: body(node.effect) },
+      },
+    };
+  });
+  return {
+    choices: [
+      ...ancestry, ...origins, ...classes, ...nodes,
+      ...forge.basicActions.map((record) => ({ ...record, kind: "ability", universal: true })),
+      ...forge.signatures.map((record) => ({ ...forgeSignatureRecord(forge,record), kind: "ability" })),
+      ...legacyChoices.filter((record) => record.kind === "trait").map((record) => {
+        const current = references.records?.[record.id];
+        if (!current || current.source.sha256 === record.source.sha256) return record;
+        const flavor = current.markdown.match(/^# [^\n]+\n\n\*([^\n]+)\*/)?.[1];
+        const ruleText = current.markdown.split(/\n## Rules\s*\n/)[1]?.split(/\n---\n/)[0]?.trim();
+        return {
+          ...record, ...current,
+          reference: {
+            flavor: flavor ? [flavor] : [],
+            rules: { details: [], body: ruleText?.split(/\n\s*\n/).map((text) => ({ text })) ?? [] },
+          },
+        };
+      }),
+    ],
+    legacyChoices,
+    languages: [...DEFAULT_LANGUAGES, ...["Reed Speech", "River Speech"].map((name) => ({
+      id: name.toLowerCase().replace(" ", "-"), name, ordinary: true, form: "spoken", writing: true,
+    }))],
+    inventory: forgeInventory({
+      ...inventory,
+      forge: true,
+      equipment: [
+        ...inventory.equipment.map((item) => references.equipment?.find((record) => record.id === item.id) ?? item),
+        ...(references.equipment ?? []).filter((item) => !inventory.equipment.some((record) => record.id === item.id)),
+      ],
+      recipes: references.recipes ?? inventory.recipes,
+    }, forge),
+    wounds,
+    forge,
+    commit: forge.sourceCommit,
+  };
+}
